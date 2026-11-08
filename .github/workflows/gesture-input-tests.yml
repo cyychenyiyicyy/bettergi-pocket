@@ -21,13 +21,13 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # ubuntu-latest 已预装 Android SDK 与 cmdline-tools；setup-android@v3 会尝试安装
+      # 早已从 SDK 仓库下架的 "tools" 包导致失败，这里直接使用预装 SDK。
       - name: Install Android SDK components
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager 'platforms;android-36.1' 'build-tools;36.0.0' 'platform-tools'
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" 'platforms;android-36.1' 'build-tools;36.0.0'
 
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
