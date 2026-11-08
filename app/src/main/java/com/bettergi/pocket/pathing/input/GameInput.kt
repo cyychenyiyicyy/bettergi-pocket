@@ -163,7 +163,12 @@ class GameInput(
 
     fun releaseAll(): InputResult {
         viewTouch = null
-        if (!client.releaseAllAndWait()) throw TouchReleaseException()
+        if (!client.releaseAllAndWait()) {
+            // 手势可能被系统取消（例如用户触屏）导致无法确认抬手；重置后再试一次，
+            // 避免一次误触就让后续任务都必须手动关闭再开启无障碍服务。
+            client.reset()
+            if (!client.releaseAllAndWait()) throw TouchReleaseException()
+        }
         return InputResult.Ok
     }
 

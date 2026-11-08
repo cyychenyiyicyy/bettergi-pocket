@@ -19,4 +19,11 @@ interface TouchClient {
     fun releaseAll(): Boolean
     /** 工作线程调用：等待实际抬手完成；同步客户端可沿用 releaseAll。 */
     fun releaseAllAndWait(timeoutMs: Long = 3000L): Boolean = releaseAll()
+
+    /**
+     * 无法确认抬手时强制清空无障碍进程内的手势记录。
+     * 用于外部取消/回调丢失后的恢复：调用后重新 [releaseAllAndWait] 即可从干净状态继续，
+     * 不再需要用户手动关闭再开启无障碍服务。返回是否重置成功。
+     */
+    fun reset(): Boolean = releaseAll()
 }

@@ -299,4 +299,105 @@ class GestureReleaseInstrumentedTest {
         assertFalse(release.get(1, TimeUnit.SECONDS))
         assertFalse(h.release().get(1, TimeUnit.SECONDS))
     }
+
+    // ---- 外部取消（用户触屏）后的恢复能力 ----
+
+    @Test
+    fun externalCancelDuringReleaseIsRecoverableAfterReset() {
+        val h = Harness()
+        onMain { assertTrue(h.composer.padHold(100, 100)) }
+        h.finish()
+        val release = h.release()
+        onMain { assertEquals(1, h.pending.size) }
+        h.finish(cancel = true) // 抬手笔画被系统取消，例如用户手指触屏
+        assertFalse(release.get(1, TimeUnit.SECONDS))
+        onMain {
+            // 未修复时这里会永远 false，只能重新开关无障碍服务；修复后 reset 即可恢复。
+            assertFalse(h.composer.tap(300, 300, 50))
+            assertTrue(h.composer.reset())
+        }
+        val retry = h.release()
+        assertTrue(retry.get(1, TimeUnit.SECONDS))
+        onMain { assertTrue(h.composer.tap(300, 300, 50)) }
+        h.finish()
+    }
+
+    @Test
+    fun externalCancelWhileHoldingRebuildsAfterDelay() {
+        val h = Harness()
+        onMain { assertTrue(h.composer.padHold(100, 100)) }
+        h.finish()
+        onMain { assertTrue(h.composer.dragBegin(400, 400)) }
+        h.finish(cancel = true) // 用户触屏取消当前手势
+        // 不能立刻重新 DOWN（会再次被取消并连锁），要等延迟重建。
+        onMain { assertTrue(h.pending.isEmpty()) }
+        SystemClock.sleep(REBUILD_WAIT_MS)
+        instrumentation.waitForIdleSync()
+        onMain {
+            assertEquals(1, h.pending.size)
+            assertEquals(2, h.pending.first().gesture.strokeCount)
+        }
+        h.finish()
+        onMain { assertTrue(h.composer.padHold(150, 150)) }
+        h.finish()
+    }
+
+    @Test
+    fun dragStepAfterExternalCancelRepressesInsteadOfFailing() {
+        val h = Harness()
+        onMain { assertTrue(h.composer.padHold(100, 100)) }
+        h.finish()
+        onMain { assertTrue(h.composer.dragBegin(400, 400)) }
+        h.finish()
+        onMain {
+            assertTrue(h.composer.reset())
+            // 记录已清空时 dragStep 不能返回 false，否则执行器会抛"视角手势派发失败"中断整条路线。
+            assertTrue(h.composer.dragStep(450, 450, 80))
+        }
+        onMain { assertEquals(1, h.pending.size) }
+        h.finish()
+    }
+
+    @Test
+    fun repeatedExternalCancelsClearHoldButKeepServiceUsable() {
+        val h = Harness()
+        onMain { assertTrue(h.composer.padHold(100, 100)) }
+        repeat(4) {
+            h.finish(cancel = true)
+            SystemClock.sleep(REBUILD_WAIT_MS)
+            instrumentation.waitForIdleSync()
+        }
+        onMain {
+            // 连续取消超过上限后丢弃本地记录，但不能把服务留在不可恢复状态。
+            assertFalse(h.composer.hasHold())
+            assertTrue(h.composer.padHold(200, 200))
+        }
+        h.finish()
+    }
+
+    @Test
+    fun lostDispatchCallbackIsRecoveredByWatchdog() {
+        val h = Harness()
+        onMain { assertTrue(h.composer.padHold(100, 100)) }
+        // 系统既不回调 onCompleted 也不回调 onCancelled：旧实现会永远停在 dispatching。
+        SystemClock.sleep(WATCHDOG_WAIT_MS)
+        instrumentation.waitForIdleSync()
+        onMain {
+            assertFalse(h.composer.hasHold())
+            assertTrue(h.composer.padHold(200, 200))
+        }
+        h.finish()
+        val release = h.release()
+        onMain { assertEquals(1, h.pending.size) }
+        h.finish()
+        assertTrue(release.get(1, TimeUnit.SECONDS))
+    }
+
+    private companion object {
+        /** 外部取消后的延迟重建等待时间，需大于 GestureComposer.REBUILD_DELAY_MS。 */
+        const val REBUILD_WAIT_MS = 300L
+
+        /** 派发看门狗等待时间，需大于 GestureComposer.DISPATCH_TIMEOUT_MS。 */
+        const val WATCHDOG_WAIT_MS = 3500L
+    }
 }

@@ -83,6 +83,7 @@ class InputAccessibilityService : AccessibilityService() {
         private const val METHOD_DRAG_END = "drag.end"
         private const val METHOD_RELEASE_ALL = "releaseAll"
         private const val METHOD_RELEASE_ALL_AND_WAIT = "releaseAllAndWait"
+        private const val METHOD_RESET = "reset"
         private const val KEY_CONNECTED = "connected"
         private const val KEY_LAST_PACKAGE = "last_package"
         private const val KEY_X = "x"
@@ -306,6 +307,7 @@ class InputAccessibilityService : AccessibilityService() {
                 METHOD_RELEASE_ALL_AND_WAIT -> okBundle(
                     composer()?.releaseAllAndWait(extras.long(KEY_DURATION, 3000L)) == true,
                 )
+                METHOD_RESET -> okBundle(composer()?.reset() == true)
                 else -> Bundle()
             }
         }
@@ -364,6 +366,9 @@ class InputAccessibilityService : AccessibilityService() {
         fun releaseAllTouchesAndWait(timeoutMs: Long): Boolean = call(
             METHOD_RELEASE_ALL_AND_WAIT, Bundle().apply { putLong(KEY_DURATION, timeoutMs) },
         ) { it.releaseAllAndWait(timeoutMs) }
+
+        /** 强制清空手势记录；用于外部取消后恢复，不需要用户重新开关无障碍服务。 */
+        fun resetGestureState(): Boolean = call(METHOD_RESET) { it.reset() }
 
         private fun clickLocal(x: Int, y: Int, durationMs: Long): Boolean {
             return composer()?.tap(x, y, durationMs) == true

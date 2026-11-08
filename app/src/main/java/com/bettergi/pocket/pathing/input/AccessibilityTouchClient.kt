@@ -32,4 +32,6 @@ object AccessibilityTouchClient : TouchClient {
     override fun releaseAll(): Boolean = InputAccessibilityService.releaseAllTouches()
 
     override fun releaseAllAndWait(timeoutMs: Long): Boolean = InputAccessibilityService.releaseAllTouchesAndWait(timeoutMs)
+
+    override fun reset(): Boolean = InputAccessibilityService.resetGestureState()
 }

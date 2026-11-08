@@ -60,6 +60,9 @@ class GestureComposer internal constructor(
     private var freshPointersInStream = 0
     private val releaseWaiters = ArrayList<ReleaseWaiter>()
 
+    /** 外部取消后延迟重建尚未执行；期间的按住变化先合并，避免与用户手指抢输入。 */
+    private var rebuildPending = false
+
     private class ReleaseWaiter {
         val done = CountDownLatch(1)
         var success = false
@@ -74,6 +77,17 @@ class GestureComposer internal constructor(
             emit()
         }
     }
+
+    /** 外部取消后延迟重建，等用户手指离开屏幕，避免重新 DOWN 被系统连续取消。 */
+    private val rebuild = Runnable {
+        rebuildPending = false
+        if (dispatching || releasing || releaseFailed || fingers.isEmpty()) return@Runnable
+        pendingHoldChange = false
+        emit(pendingInstants.removeFirstOrNull() ?: emptyList())
+    }
+
+    /** 派发回调丢失的看门狗：不重置的话后续手势会一直排队，表现为"所有点击失效"。 */
+    private val dispatchWatchdog = Runnable { onDispatchTimeout() }
 
     fun padHold(x: Int, y: Int): Boolean = buttonDown(PAD_ID, x, y)
 
@@ -96,6 +110,10 @@ class GestureComposer internal constructor(
         finger.segmentMs = HOLD_SLICE_MS
         finger.lift = false
         externalRestarts = 0
+        if (rebuildPending) {
+            // 外部取消后的延迟重建还没执行，这次按下并入那一次派发。
+            return@runSync true
+        }
         emit()
     }
 
@@ -148,11 +166,16 @@ class GestureComposer internal constructor(
     fun dragStep(x: Int, y: Int, durationMs: Long): Boolean = runSync {
         if (releasing || releaseFailed) return@runSync false
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || x < 0 || y < 0) return@runSync false
-        val finger = fingers[DRAG_ID] ?: return@runSync false
+        // 外部取消会丢笔画记录；这里重新按下，避免一次人工触屏就让整条路线因
+        // "视角手势派发失败"中断。
+        val finger = fingers[DRAG_ID] ?: return@runSync buttonDown(DRAG_ID, x, y)
         finger.x = x.toFloat()
         finger.y = y.toFloat()
         finger.segmentMs = durationMs.coerceAtLeast(1L)
         finger.lift = false
+        if (rebuildPending) {
+            return@runSync true
+        }
         emit()
     }
 
@@ -196,8 +219,12 @@ class GestureComposer internal constructor(
         // 停止后不再执行排队的点按或转向；正在执行的笔画完成后立即松开持续触点。
         pendingInstants.clear()
         pendingHoldChange = false
+        cancelRebuild()
         handler.removeCallbacks(renew)
         if (releaseUncertain) {
+            // 上一次释放被系统取消或回调丢失，本地记录已不可信。清掉记录，让上层
+            // reset() 后从干净状态恢复；本次仍返回失败，不能冒充已经抬起。
+            fingers.clear()
             finishRelease(false)
             return false
         }
@@ -223,6 +250,8 @@ class GestureComposer internal constructor(
             emit()
         } catch (e: RuntimeException) {
             Log.w("BetterGI.Gesture", "无法续接抬手笔画", e)
+            fingers.clear()
+            dispatching = false
             releaseUncertain = true
             finishRelease(false)
             false
@@ -238,6 +267,35 @@ class GestureComposer internal constructor(
         waiters.forEach { it.complete(success) }
     }
 
+    /**
+     * 上层确认要重试时强制清空手势记录。
+     * 用于外部取消/回调丢失后的恢复，避免必须让用户手动关闭再开启无障碍服务。
+     */
+    fun reset(): Boolean = runSync {
+        resetLocked()
+        true
+    }
+
+    private fun resetLocked() {
+        handler.removeCallbacks(renew)
+        handler.removeCallbacks(dispatchWatchdog)
+        cancelRebuild()
+        generation += 1
+        dispatching = false
+        pendingInstants.clear()
+        pendingHoldChange = false
+        fingers.clear()
+        externalRestarts = 0
+        freshPointersInStream = 0
+        releasing = false
+        releaseFailed = false
+        releaseUncertain = false
+        val waiters = releaseWaiters.toList()
+        releaseWaiters.clear()
+        waiters.forEach { it.complete(false) }
+        Log.i("BetterGI.Gesture", "手势状态已重置")
+    }
+
     fun hasHold(): Boolean = fingers.isNotEmpty()
 
     private class Instant(val path: Path, val durationMs: Long)
@@ -245,6 +303,12 @@ class GestureComposer internal constructor(
     private fun emit(instants: List<Instant> = emptyList()): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return false
         if (dispatching) {
+            if (instants.isNotEmpty()) pendingInstants.addLast(instants)
+            pendingHoldChange = true
+            return true
+        }
+        if (rebuildPending && !releasing) {
+            // 外部取消后的延迟重建还没执行，按住变化和瞬时动作先并入那一次派发。
             if (instants.isNotEmpty()) pendingInstants.addLast(instants)
             pendingHoldChange = true
             return true
@@ -325,6 +389,7 @@ class GestureComposer internal constructor(
             finger.segmentMs = if (finger.lift) LIFT_MS else HOLD_SLICE_MS
         }
         scheduleRenew()
+        armDispatchWatchdog()
         return true
     }
 
@@ -354,6 +419,7 @@ class GestureComposer internal constructor(
             override fun onCompleted(gestureDescription: GestureDescription?) {
                 handler.post {
                     if (gen != generation) return@post
+                    handler.removeCallbacks(dispatchWatchdog)
                     dispatching = false
                     freshPointersInStream = 0
                     fingers.values.forEach { it.stroke = null }
@@ -373,6 +439,7 @@ class GestureComposer internal constructor(
             override fun onCancelled(gestureDescription: GestureDescription?) {
                 handler.post {
                     if (gen != generation) return@post
+                    handler.removeCallbacks(dispatchWatchdog)
                     dispatching = false
                     pendingInstants.clear()
                     pendingHoldChange = false
@@ -387,6 +454,8 @@ class GestureComposer internal constructor(
             pendingInstants.clear()
             pendingHoldChange = false
             finishRelease(false)
+        } else {
+            armDispatchWatchdog()
         }
         return accepted
     }
@@ -397,7 +466,10 @@ class GestureComposer internal constructor(
         lifted: List<Pair<Finger, GestureDescription.StrokeDescription>> = emptyList(),
     ) {
         if (gen != generation) return
+        handler.removeCallbacks(dispatchWatchdog)
         dispatching = false
+        // 系统确认完成说明输入通道正常，连续取消计数重新开始。
+        externalRestarts = 0
         lifted.forEach { (finger, stroke) ->
             if (fingers[finger.id] === finger && finger.stroke === stroke) fingers.remove(finger.id)
         }
@@ -414,30 +486,75 @@ class GestureComposer internal constructor(
         }
     }
 
+    /**
+     * 系统取消手势（最常见的原因就是用户手指触屏）。
+     * 取消时目标应用会收到 ACTION_CANCEL，注入触点已经由系统抬起；旧 StrokeDescription
+     * 不能再续接，所以本地记录一律退回"需要重新按下"，并且不能把这次取消变成永久锁死。
+     */
     private fun onExternalCancel(gen: Int) {
         if (gen != generation) return
+        handler.removeCallbacks(dispatchWatchdog)
         dispatching = false
         pendingInstants.clear()
         pendingHoldChange = false
-        if (releasing || releaseFailed || fingers.values.any { it.lift }) {
-            // 清理被取消不能重建按住，也不能把取消回调当作抬手完成。
+        val lifting = releasing || releaseFailed || fingers.values.any { it.lift }
+        fingers.values.forEach {
+            it.stroke = null
+            it.lift = false
+        }
+        if (lifting) {
+            // 抬手过程中被取消：这次释放无法确认，但不能冒充已抬起；交给上层 reset 后重试。
             handler.removeCallbacks(renew)
+            cancelRebuild()
             releaseUncertain = true
             finishRelease(false)
             return
         }
-        Log.w("BetterGI.Gesture", "手势被取消，重建持续触点 count=${fingers.size}")
-        fingers.values.forEach { it.stroke = null }
         if (fingers.isEmpty()) return
         externalRestarts += 1
         if (externalRestarts > MAX_EXTERNAL_RESTARTS) {
+            // 连续取消通常是用户手指还停在屏幕上。丢弃本地记录，等下一次动作重新按下，
+            // 不能把服务留在不可恢复状态（否则重启应用也无法恢复）。
+            Log.w("BetterGI.Gesture", "连续被取消，丢弃按住状态 count=${fingers.size}")
             fingers.clear()
+            externalRestarts = 0
             handler.removeCallbacks(renew)
-            releaseUncertain = true
-            finishRelease(false)
+            cancelRebuild()
             return
         }
-        emit()
+        // 用户手指可能还按在屏幕上，立即重新 DOWN 会被再次取消并形成连锁，延后重建。
+        Log.w("BetterGI.Gesture", "手势被取消，${REBUILD_DELAY_MS}ms 后重建持续触点 count=${fingers.size}")
+        handler.removeCallbacks(rebuild)
+        rebuildPending = true
+        handler.postDelayed(rebuild, REBUILD_DELAY_MS)
+    }
+
+    private fun cancelRebuild() {
+        rebuildPending = false
+        handler.removeCallbacks(rebuild)
+    }
+
+    /** 派发回调丢失：丢弃本批次触点记录并允许重新派发，避免后续手势一直排队。 */
+    private fun onDispatchTimeout() {
+        if (!dispatching) return
+        Log.w("BetterGI.Gesture", "手势回调超时，丢弃本批次触点记录并允许重新派发")
+        handler.removeCallbacks(renew)
+        generation += 1
+        dispatching = false
+        pendingInstants.clear()
+        pendingHoldChange = false
+        fingers.clear()
+        externalRestarts = 0
+        cancelRebuild()
+        if (releasing) {
+            releaseUncertain = true
+            finishRelease(false)
+        }
+    }
+
+    private fun armDispatchWatchdog() {
+        handler.removeCallbacks(dispatchWatchdog)
+        handler.postDelayed(dispatchWatchdog, DISPATCH_TIMEOUT_MS)
     }
 
     /** 定期检查待续接状态；静止时由 emit 跳过，不能派发空续段。 */
@@ -481,7 +598,7 @@ class GestureComposer internal constructor(
                 handler.post { onExternalCancel(gen) }
             }
         }, handler)
-        if (!accepted) dispatching = false
+        if (!accepted) dispatching = false else armDispatchWatchdog()
         return accepted
     }
 
@@ -517,6 +634,12 @@ class GestureComposer internal constructor(
         const val MAX_EXTERNAL_RESTARTS = 3
         const val SYNC_TIMEOUT_MS = 3000L
         const val POINTER_STREAM_BUDGET = 8
+
+        /** 外部取消后延迟重建，等用户手指离开屏幕，避免立即 DOWN 被再次取消形成连锁。 */
+        const val REBUILD_DELAY_MS = 120L
+
+        /** 派发回调迟迟不来时重置状态，避免所有后续手势一直排队。 */
+        const val DISPATCH_TIMEOUT_MS = 2500L
 
         /** 零长度路径由系统按点按处理，终点等于起点，便于续接。 */
         fun pointPath(x: Float, y: Float): Path = Path().apply {

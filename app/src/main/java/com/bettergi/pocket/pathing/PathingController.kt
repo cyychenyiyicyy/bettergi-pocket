@@ -204,6 +204,17 @@ class PathingController(
         return RoutePrerequisites(PathingPreflight(), layout, size)
     }
 
+    /**
+     * 释放触点。手势被系统取消（用户触屏）后，无障碍进程可能保留"释放未确认"状态；
+     * 先重置手势记录再重试一次，避免一次人工触屏就让后续任务都必须手动开关无障碍服务。
+     */
+    private fun releaseTouchesOrReset(): Boolean {
+        if (touch.releaseAllAndWait()) return true
+        log("触点释放未确认，重置手势状态后重试")
+        if (!touch.reset()) return false
+        return touch.releaseAllAndWait()
+    }
+
     private fun startRouteLocked() {
         val prerequisites = checkRoutePrerequisites()
         val check = prerequisites.result
@@ -219,7 +230,7 @@ class PathingController(
         val thread = Thread({
             var outcome: String? = null
             try {
-                if (!touch.releaseAllAndWait()) throw TouchReleaseException()
+                if (!releaseTouchesOrReset()) throw TouchReleaseException()
                 runtime.delay(0)
                 log("任务开始前已释放触点")
                 onStatus("正在读取路线…")
@@ -299,7 +310,7 @@ class PathingController(
                     log("地图追踪已停止：$it")
                     outcome = it
                 }
-                if (!touch.releaseAllAndWait()) {
+                if (!releaseTouchesOrReset()) {
                     outcome = TouchReleaseException().message
                     log(outcome ?: "触点释放未确认")
                 }

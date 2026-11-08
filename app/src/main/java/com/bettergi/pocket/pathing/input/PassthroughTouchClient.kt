@@ -147,6 +147,12 @@ class PassthroughTouchClient(
         }
     }
 
+    override fun reset(): Boolean = onMain {
+        val ok = delegate.reset()
+        restoreHolds()
+        ok
+    }
+
     private fun restoreHolds() {
         var armed = armedButtons.size
         armedButtons.clear()
