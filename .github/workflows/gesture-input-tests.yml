@@ -33,6 +33,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       # 手势单测不依赖地图追踪资源，构建精简版即可，省掉 NDK 与 185 MiB 地图资源。
+      # 应用默认只打包 arm64-v8a；CI 模拟器是 x86_64，这里只在 CI 工作区放开 ABI（不提交此改动）。
+      - name: Allow x86_64 ABI for the emulator
+        run: sed -i 's/abiFilters += "arm64-v8a"/abiFilters += setOf("arm64-v8a", "x86_64")/' app/build.gradle.kts
+
       - name: Build debug and androidTest APKs
         run: |
           chmod +x gradlew
